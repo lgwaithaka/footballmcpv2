@@ -1,0 +1,151 @@
+name: CI — Lint, Test & Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── Stage 1: Lint & syntax ─────────────────────────────────────────────────
+  lint:
+    name: 🔍 Syntax & Import Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Syntax check
+        run: |
+          python -m py_compile server.py          && echo "✅ server.py"
+          python -m py_compile analytics_engine.py && echo "✅ analytics_engine.py"
+          python -m py_compile schedule_data.py    && echo "✅ schedule_data.py"
+
+      - name: Import check
+        run: |
+          python -c "
+          from analytics_engine import run_prediction, init_db, MarketData
+          print('✅ analytics_engine imports OK')
+          from schedule_data import all_fixtures, fixture_by_id
+          fixtures = all_fixtures()
+          print(f'✅ schedule_data imports OK — {len(fixtures)} fixtures loaded')
+          "
+
+  # ── Stage 2: Unit tests ────────────────────────────────────────────────────
+  test:
+    name: 🧪 Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests
+        env:
+          DB_PATH: /tmp/ci_test.db
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+
+          from analytics_engine import (
+              MarketData, run_prediction, select_pick,
+              remove_margin, provider_margin, init_db,
+          )
+          from schedule_data import all_fixtures, fixture_by_id
+
+          init_db()
+          failures = []
+
+          # Test 1 — Margin removal produces probabilities summing to 1.0
+          lines = MarketData(1.50, 4.00, 6.00)
+          p = remove_margin(lines)
+          assert abs(sum(p) - 1.0) < 0.0001, f'Probs sum to {sum(p)}, expected 1.0'
+          print('✅ Test 1 — remove_margin: probabilities sum to 1.0')
+
+          # Test 2 — Heavy favourite correctly flagged as high-confidence home pick
+          fav = MarketData(1.18, 6.00, 14.00)
+          r   = run_prediction(fav, None)
+          assert r['hp'] > 0.72, f'Expected hp > 0.72, got {r[\"hp\"]}'
+          label, code, conf = select_pick(r['hp'], r['dp'], r['ap'])
+          assert 'H' in code, f'Expected home pick, got code={code}'
+          print(f'✅ Test 2 — heavy favourite: {label} ({conf:.0%})')
+
+          # Test 3 — Even fixture produces balanced probabilities
+          even = MarketData(2.00, 3.40, 3.50)
+          r2   = run_prediction(even, None)
+          assert 0.30 < r2['hp'] < 0.65, f'Home prob out of range: {r2[\"hp\"]}'
+          print(f'✅ Test 3 — balanced fixture: H={r2[\"hp\"]:.0%} D={r2[\"dp\"]:.0%} A={r2[\"ap\"]:.0%}')
+
+          # Test 4 — Provider margin is in realistic range
+          lines2  = MarketData(2.32, 3.55, 3.15)
+          margin  = provider_margin(lines2)
+          assert 0 < margin < 15, f'Unrealistic margin: {margin}'
+          print(f'✅ Test 4 — provider margin: {margin}%')
+
+          # Test 5 — Two providers produce lower margin than single
+          lines_a = MarketData(3.15, 3.40, 2.32)
+          lines_b = MarketData(3.20, 3.45, 2.34)
+          from analytics_engine import consensus_lines
+          avg_lines, gap = consensus_lines(lines_a, lines_b)
+          assert gap < 0.05, f'Unexpected consensus gap: {gap}'
+          print(f'✅ Test 5 — consensus: gap={gap:.4f}')
+
+          # Test 6 — Schedule data loads and lookup works
+          fixtures = all_fixtures()
+          assert len(fixtures) >= 25, f'Expected >= 25 fixtures, got {len(fixtures)}'
+          f = fixture_by_id(10158)   # Atalanta vs Juventus (Provider B ID)
+          assert f is not None, 'Fixture 10158 not found'
+          assert 'Atalanta' in f.home_team, f'Wrong team: {f.home_team}'
+          print(f'✅ Test 6 — schedule: {len(fixtures)} fixtures, lookup OK')
+
+          # Test 7 — xG values are positive
+          r3 = run_prediction(MarketData(2.50, 3.20, 2.80), None,
+                              home_scored=1.5, away_scored=1.1)
+          assert r3['home_xg'] > 0 and r3['away_xg'] > 0
+          print(f'✅ Test 7 — xG estimates: home={r3[\"home_xg\"]} away={r3[\"away_xg\"]}')
+
+          print()
+          print('🎉 All 7 tests passed!')
+          "
+
+  # ── Stage 3: Deploy (main branch only) ────────────────────────────────────
+  deploy:
+    name: 🚀 Deploy to Render
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Trigger Render deploy hook
+        run: |
+          if [ -z "${{ secrets.RENDER_DEPLOY_HOOK }}" ]; then
+            echo "⚠️  RENDER_DEPLOY_HOOK secret not set — skipping deploy trigger."
+            echo "    Add it: GitHub repo → Settings → Secrets → Actions → New secret"
+          else
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}" \
+              -H "Content-Type: application/json")
+            if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "201" ]; then
+              echo "✅ Render deploy triggered (HTTP $HTTP_STATUS)"
+            else
+              echo "❌ Render deploy hook returned HTTP $HTTP_STATUS"
+              exit 1
+            fi
+          fi
