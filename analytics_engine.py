@@ -1,0 +1,517 @@
+"""
+analytics_engine.py
+────────────────────
+Multi-signal statistical prediction engine — 5 outcome markets.
+
+Outcomes predicted:
+  1. Home Win
+  2. Draw
+  3. Away Win
+  4. Over 2.5 Goals
+  5. Both Teams to Score (BTTS)
+
+Signals:
+  1. Market-implied probability  (vig removal + consensus)
+  2. Recent form                 (last-5 weighted)
+  3. xG proxy                    (scoring/conceding rates)
+  4. Head-to-head record
+  5. Home field advantage
+  6. League position gap
+
+Self-learning: predictions logged to SQLite; weights recalibrate after 20+ outcomes.
+"""
+
+import sqlite3
+import os
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Optional
+
+DB_PATH = os.getenv("DB_PATH", "analytics.db")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data classes
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class MarketData:
+    """Decimal market lines for home / draw / away outcomes."""
+    home: float
+    draw: float
+    away: float
+
+
+@dataclass
+class GoalMarketData:
+    """Decimal market lines for over/under and BTTS."""
+    over_2_5: float
+    under_2_5: float
+    btts_yes: float
+    btts_no: float
+
+
+@dataclass
+class AnalyticsResult:
+    """Full output of the prediction engine for one fixture — 5 outcomes."""
+    fixture_id: str
+    home_team: str
+    away_team: str
+    league: str
+    country: str
+    kickoff: str
+    date: str
+
+    # 3-way outcome probabilities
+    home_prob: float
+    draw_prob: float
+    away_prob: float
+
+    # Goal market probabilities
+    over_25_prob: float
+    btts_prob: float
+
+    # Recommended pick
+    recommended_pick: str
+    pick_code: str
+    confidence: float
+    confidence_pct: int
+    confidence_label: str
+
+    # Diagnostics
+    provider_margin_pct: float
+    consensus_gap_pct: float
+    home_form_pts: float
+    away_form_pts: float
+    home_xg: float
+    away_xg: float
+    h2h_home: int
+    h2h_draw: int
+    h2h_away: int
+    model_version: str = "v2.1"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SQLite — self-learning persistence
+# ─────────────────────────────────────────────────────────────────────────────
+
+def init_db() -> None:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS predictions (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            fixture_id    TEXT,
+            home_team     TEXT,
+            away_team     TEXT,
+            league        TEXT,
+            kickoff       TEXT,
+            pick          TEXT,
+            pick_code     TEXT,
+            confidence    REAL,
+            home_prob     REAL,
+            draw_prob     REAL,
+            away_prob     REAL,
+            over_25_prob  REAL,
+            btts_prob     REAL,
+            created_at    TEXT,
+            actual_result TEXT    DEFAULT NULL,
+            was_correct   INTEGER DEFAULT NULL
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS model_weights (
+            key   TEXT PRIMARY KEY,
+            value REAL
+        )
+    """)
+    defaults = [
+        ("w_market",     0.55),
+        ("w_form",       0.20),
+        ("w_h2h",        0.07),
+        ("w_home_field", 0.08),
+        ("w_position",   0.10),
+    ]
+    for k, v in defaults:
+        c.execute("INSERT OR IGNORE INTO model_weights (key, value) VALUES (?, ?)", (k, v))
+    conn.commit()
+    conn.close()
+
+
+def persist_result(res: AnalyticsResult) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO predictions
+          (fixture_id, home_team, away_team, league, kickoff,
+           pick, pick_code, confidence, home_prob, draw_prob, away_prob,
+           over_25_prob, btts_prob, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        res.fixture_id, res.home_team, res.away_team, res.league, res.kickoff,
+        res.recommended_pick, res.pick_code, res.confidence,
+        res.home_prob, res.draw_prob, res.away_prob,
+        res.over_25_prob, res.btts_prob,
+        datetime.now(timezone.utc).isoformat(),
+    ))
+    conn.commit()
+    conn.close()
+
+
+def record_actual_outcome(fixture_id: str, actual: str) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT id, pick_code FROM predictions WHERE fixture_id=? ORDER BY id DESC LIMIT 1",
+        (fixture_id,),
+    )
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return False
+    pred_id, pick_code = row
+    correct = int(actual in pick_code)
+    c.execute(
+        "UPDATE predictions SET actual_result=?, was_correct=? WHERE id=?",
+        (actual, correct, pred_id),
+    )
+    conn.commit()
+    conn.close()
+    _recalibrate()
+    return True
+
+
+def accuracy_report() -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT COUNT(*),
+               SUM(CASE WHEN was_correct IS NOT NULL THEN 1 ELSE 0 END),
+               SUM(CASE WHEN was_correct = 1 THEN 1 ELSE 0 END)
+        FROM predictions
+    """)
+    total, graded, correct = c.fetchone()
+    graded  = graded  or 0
+    correct = correct or 0
+    accuracy = round(correct / graded * 100, 1) if graded > 0 else 0.0
+    c.execute("""
+        SELECT pick_code, COUNT(*), SUM(was_correct)
+        FROM predictions WHERE was_correct IS NOT NULL
+        GROUP BY pick_code
+    """)
+    by_pick = {}
+    for row in c.fetchall():
+        code, tot, wins = row
+        wins = wins or 0
+        by_pick[code] = {"total": tot, "correct": wins,
+                         "accuracy_pct": round(wins / tot * 100, 1)}
+    conn.close()
+    return {"total_logged": total or 0, "graded": graded,
+            "correct": correct, "accuracy_pct": accuracy, "by_pick_type": by_pick}
+
+
+def load_weights() -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT key, value FROM model_weights")
+    w = {row[0]: row[1] for row in c.fetchall()}
+    conn.close()
+    return w
+
+
+def _recalibrate() -> None:
+    report = accuracy_report()
+    if report["graded"] < 20:
+        return
+    acc = report["accuracy_pct"] / 100.0
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if acc < 0.60:
+        c.execute("UPDATE model_weights SET value=0.65 WHERE key='w_market'")
+        c.execute("UPDATE model_weights SET value=0.15 WHERE key='w_form'")
+    elif acc > 0.75:
+        c.execute("UPDATE model_weights SET value=0.50 WHERE key='w_market'")
+        c.execute("UPDATE model_weights SET value=0.25 WHERE key='w_form'")
+    conn.commit()
+    conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Market probability math
+# ─────────────────────────────────────────────────────────────────────────────
+
+def remove_margin(lines: MarketData) -> tuple[float, float, float]:
+    raw = [1.0 / lines.home, 1.0 / lines.draw, 1.0 / lines.away]
+    total = sum(raw)
+    return raw[0] / total, raw[1] / total, raw[2] / total
+
+
+def remove_margin_2way(price_yes: float, price_no: float) -> tuple[float, float]:
+    """Remove vig from a 2-way market (e.g. Over/Under, BTTS)."""
+    raw_yes = 1.0 / price_yes
+    raw_no  = 1.0 / price_no
+    total   = raw_yes + raw_no
+    return raw_yes / total, raw_no / total
+
+
+def provider_margin(lines: MarketData) -> float:
+    return round((1.0/lines.home + 1.0/lines.draw + 1.0/lines.away - 1.0) * 100, 2)
+
+
+def consensus_lines(la: MarketData, lb: Optional[MarketData]) -> tuple[MarketData, float]:
+    if lb is None:
+        return la, 0.0
+    p1 = remove_margin(la)
+    p2 = remove_margin(lb)
+    avg = [(p1[i] + p2[i]) / 2 for i in range(3)]
+    gap = max(abs(p1[i] - p2[i]) for i in range(3))
+    h = 1.0 / avg[0] if avg[0] > 0 else 99.0
+    d = 1.0 / avg[1] if avg[1] > 0 else 99.0
+    a = 1.0 / avg[2] if avg[2] > 0 else 99.0
+    return MarketData(round(h, 3), round(d, 3), round(a, 3)), round(gap, 4)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Goal market probability
+# ─────────────────────────────────────────────────────────────────────────────
+
+def goal_market_probs(
+    gm_a: Optional[GoalMarketData],
+    gm_b: Optional[GoalMarketData],
+    home_xg: float,
+    away_xg: float,
+) -> tuple[float, float]:
+    """
+    Return (over_25_prob, btts_prob).
+    Uses market data when available; falls back to xG-based Poisson approximation.
+    """
+    # ── Over 2.5 ──────────────────────────────────────────────
+    over_probs = []
+    if gm_a:
+        p, _ = remove_margin_2way(gm_a.over_2_5, gm_a.under_2_5)
+        over_probs.append(p)
+    if gm_b:
+        p, _ = remove_margin_2way(gm_b.over_2_5, gm_b.under_2_5)
+        over_probs.append(p)
+
+    if over_probs:
+        over_25 = round(sum(over_probs) / len(over_probs), 4)
+    else:
+        # Poisson approximation: P(goals > 2.5) ≈ 1 - P(0,1,2 goals)
+        import math
+        lam = home_xg + away_xg
+        p_under = sum(math.exp(-lam) * lam**k / math.factorial(k) for k in range(3))
+        over_25 = round(1.0 - p_under, 4)
+
+    # ── BTTS ─────────────────────────────────────────────────
+    btts_probs = []
+    if gm_a:
+        p, _ = remove_margin_2way(gm_a.btts_yes, gm_a.btts_no)
+        btts_probs.append(p)
+    if gm_b:
+        p, _ = remove_margin_2way(gm_b.btts_yes, gm_b.btts_no)
+        btts_probs.append(p)
+
+    if btts_probs:
+        btts = round(sum(btts_probs) / len(btts_probs), 4)
+    else:
+        # Approximation: P(home scores) * P(away scores)
+        import math
+        p_home_scores = 1.0 - math.exp(-home_xg)
+        p_away_scores = 1.0 - math.exp(-away_xg)
+        btts = round(p_home_scores * p_away_scores, 4)
+
+    return over_25, btts
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Statistical signal helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def recent_form_pts(matches: list[dict], team_id: int, n: int = 5) -> float:
+    pts = count = 0
+    for m in reversed(matches):
+        if count >= n: break
+        sc = m.get("score", {}).get("fullTime", {})
+        hg, ag = sc.get("home"), sc.get("away")
+        if hg is None or ag is None: continue
+        is_home = m["homeTeam"]["id"] == team_id
+        if is_home:
+            if hg > ag: pts += 3
+            elif hg == ag: pts += 1
+        elif m["awayTeam"]["id"] == team_id:
+            if ag > hg: pts += 3
+            elif hg == ag: pts += 1
+        count += 1
+    return float(pts)
+
+
+def scoring_averages(matches: list[dict], team_id: int, n: int = 8) -> tuple[float, float]:
+    scored = conceded = count = 0
+    for m in reversed(matches):
+        if count >= n: break
+        sc = m.get("score", {}).get("fullTime", {})
+        hg, ag = sc.get("home"), sc.get("away")
+        if hg is None or ag is None: continue
+        if m["homeTeam"]["id"] == team_id:
+            scored += hg; conceded += ag
+        elif m["awayTeam"]["id"] == team_id:
+            scored += ag; conceded += hg
+        else: continue
+        count += 1
+    if count == 0: return 1.2, 1.0
+    return round(scored / count, 2), round(conceded / count, 2)
+
+
+def h2h_record(h2h_matches: list[dict], home_id: int, away_id: int) -> dict:
+    hw = aw = draws = 0
+    for m in h2h_matches:
+        mid_home = m["homeTeam"]["id"]
+        sc = m.get("score", {}).get("fullTime", {})
+        hg, ag = sc.get("home"), sc.get("away")
+        if hg is None or ag is None: continue
+        if mid_home == home_id:
+            if hg > ag: hw += 1
+            elif hg == ag: draws += 1
+            else: aw += 1
+        else:
+            if ag > hg: hw += 1
+            elif hg == ag: draws += 1
+            else: aw += 1
+    return {"home": hw, "draw": draws, "away": aw, "total": hw + draws + aw}
+
+
+def form_string(matches: list[dict], team_id: int, n: int = 5) -> str:
+    icons = []
+    for m in reversed(matches):
+        if len(icons) >= n: break
+        sc = m.get("score", {}).get("fullTime", {})
+        hg, ag = sc.get("home"), sc.get("away")
+        if hg is None or ag is None: continue
+        is_home = m["homeTeam"]["id"] == team_id
+        if is_home:
+            icons.append("🟢" if hg > ag else ("🟡" if hg == ag else "🔴"))
+        else:
+            icons.append("🟢" if ag > hg else ("🟡" if hg == ag else "🔴"))
+    return " ".join(icons) or "N/A"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Core 3-way prediction
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_prediction(
+    lines_a: Optional[MarketData],
+    lines_b: Optional[MarketData],
+    home_form: float = 7.5,
+    away_form: float = 7.5,
+    home_scored: float = 1.2,
+    home_conceded: float = 1.1,
+    away_scored: float = 1.2,
+    away_conceded: float = 1.1,
+    h2h: Optional[dict] = None,
+    home_position: Optional[int] = None,
+    away_position: Optional[int] = None,
+    weights: Optional[dict] = None,
+) -> dict:
+    if weights is None:
+        weights = load_weights()
+
+    best = lines_a or lines_b
+    if best is None:
+        p_mkt = (0.34, 0.33, 0.33)
+        margin = 0.0; gap = 0.0
+    else:
+        if lines_a and lines_b:
+            averaged, gap = consensus_lines(lines_a, lines_b)
+            p_mkt = remove_margin(averaged)
+            margin = provider_margin(averaged)
+        else:
+            p_mkt = remove_margin(best)
+            margin = provider_margin(best)
+            gap = 0.0
+
+    hf_norm = home_form / 15.0
+    af_norm = away_form / 15.0
+    diff = hf_norm - af_norm
+    hfa = weights.get("w_home_field", 0.08)
+    fh = min(max(0.33 + diff * 0.20 + hfa, 0.05), 0.85)
+    fx = min(max(0.34 - abs(diff) * 0.10,  0.05), 0.50)
+    fa = min(max(0.33 - diff * 0.20 - hfa, 0.05), 0.85)
+    tot = fh + fx + fa
+    p_form = (fh / tot, fx / tot, fa / tot)
+
+    home_xg = (home_scored + away_conceded) / 2
+    away_xg = (away_scored + home_conceded) / 2
+    xg_diff = (home_xg - away_xg) / max(home_xg + away_xg, 0.1)
+    xh = p_mkt[0] * (1 + xg_diff * 0.10)
+    xd = p_mkt[1]
+    xa = p_mkt[2] * (1 - xg_diff * 0.10)
+    tot2 = xh + xd + xa
+    p_xg = (xh / tot2, xd / tot2, xa / tot2)
+
+    if h2h and h2h.get("total", 0) > 0:
+        tot_h2h = h2h["total"]
+        p_h2h = (h2h["home"] / tot_h2h, h2h["draw"] / tot_h2h, h2h["away"] / tot_h2h)
+    else:
+        p_h2h = p_mkt
+
+    if home_position and away_position:
+        pos_diff = (away_position - home_position) / 20.0
+        ph = min(max(0.33 + pos_diff * 0.08, 0.05), 0.85)
+        pd = 0.34
+        pa = min(max(0.33 - pos_diff * 0.08, 0.05), 0.85)
+        tot3 = ph + pd + pa
+        p_pos = (ph / tot3, pd / tot3, pa / tot3)
+    else:
+        p_pos = p_mkt
+
+    wm = weights.get("w_market", 0.55)
+    wf = weights.get("w_form",   0.20)
+    wh = weights.get("w_h2h",    0.07)
+    wp = max(1.0 - wm - wf - wh, 0.0)
+
+    blended = [wm*p_xg[i] + wf*p_form[i] + wh*p_h2h[i] + wp*p_pos[i] for i in range(3)]
+    total_blend = sum(blended)
+    hp, dp, ap = [b / total_blend for b in blended]
+
+    hp = min(max(hp, 0.04), 0.93)
+    dp = min(max(dp, 0.04), 0.50)
+    ap = min(max(ap, 0.04), 0.93)
+    tf = hp + dp + ap
+    hp, dp, ap = hp / tf, dp / tf, ap / tf
+
+    return {
+        "hp": round(hp, 4), "dp": round(dp, 4), "ap": round(ap, 4),
+        "home_xg": round(home_xg, 2), "away_xg": round(away_xg, 2),
+        "margin_pct": round(margin, 2), "consensus_gap_pct": round(gap * 100, 2),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pick selection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def select_pick(hp: float, dp: float, ap: float) -> tuple[str, str, float]:
+    if hp >= 0.50: return "Home Win", "H", hp
+    if ap >= 0.50: return "Away Win", "A", ap
+    if dp >= 0.38: return "Draw", "D", dp
+    hd = hp + dp; da = dp + ap; ha = hp + ap
+    if hd >= 0.65: return "Home Win or Draw", "HD", hd
+    if da >= 0.65: return "Draw or Away Win", "DA", da
+    if ha >= 0.65: return "Home or Away Win", "HA", ha
+    best = max(hp, dp, ap)
+    if best == hp: return "Home Win", "H", hp
+    if best == dp: return "Draw", "D", dp
+    return "Away Win", "A", ap
+
+
+def confidence_tier(c: float) -> str:
+    if c >= 0.72: return "HIGH"
+    elif c >= 0.58: return "MEDIUM"
+    return "LOW"
+
+
+def confidence_bar(confidence: float, width: int = 20) -> str:
+    filled = int(confidence * width)
+    return f"[{'█' * filled}{'░' * (width - filled)}] {int(confidence * 100)}%"
